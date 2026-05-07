@@ -1,457 +1,392 @@
-# 03.1 - Compute X86 vs Graviton
-
+# 03.1 - Compute: x86 vs Graviton
 
 **Antes de começar, execute os passos abaixo para configurar o ambiente caso não tenha feito isso ainda na aula de HOJE: [Preparando Credenciais](../../01-create-codespaces/Inicio-de-aula.md)**
 
-### 🔍 Introdução ao Laboratório: Comparando Arquiteturas EC2 (x86 vs Graviton)
+Os comandos deste lab rodam em **três ambientes distintos**: o provisionamento (Parte 1) no terminal do **Codespaces**; os benchmarks (Partes 2–6) dentro de **duas sessões SSM simultâneas** — uma na instância x86 e outra na Graviton. Cada passo sinaliza onde executar.
 
-Neste laboratório prático, você irá explorar na prática as diferenças entre duas arquiteturas de instâncias EC2 amplamente utilizadas na AWS: **x86_64 (Intel/AMD)** e **Graviton (ARM64)**.
+> [!WARNING]
+> **Pré-requisitos — confira antes de começar:**
+>
+> - [ ] Codespace aberto e sincronizado com credenciais da AWS Academy (rodou o [Preparando Credenciais](../../01-create-codespaces/Inicio-de-aula.md) na aula de hoje).
+> - [ ] `aws sts get-caller-identity` retorna um `Account` e um `Arn` sem erro.
+> - [ ] `aws s3 ls | grep base-config-` lista exatamente **um** bucket do seu RM.
+> - [ ] `terraform -version` retorna >= 1.3.
+> - [ ] Nenhuma EC2 deste lab já existe (`aws ec2 describe-instances --filters "Name=tag:Name,Values=x86,graviton" --query "Reservations[].Instances[?State.Name=='running'].InstanceId"` retorna `[]`).
+>
+> **O que você vai fazer:** provisionar duas EC2s idênticas (mesmo vCPU e RAM) mas com arquiteturas diferentes — Intel x86_64 (`t3.large`) e AWS Graviton ARM64 (`t4g.large`) — e rodar 5 benchmarks lado a lado. **Tempo estimado: 50 minutos.**
 
-Você aprenderá a:
+Este laboratório responde uma pergunta concreta de arquitetura: **vale a pena migrar workloads para Graviton?** A resposta técnica depende do tipo de workload — e este lab te dá os dados para defender sua posição em code review ou apresentação. Você vai cronometrar CPU single-thread, CPU multi-thread, banda de memória, compressão, Python recursivo e SHA-256 em Node.js. Ao final, os números falam.
 
-- Lançar instâncias EC2 com **Ubuntu 22.04** em ambas as arquiteturas.
-- Instalar ferramentas de benchmark como `sysbench`, `gzip`, `Python` e `Node.js`.
-- Executar testes de CPU, memória e compressão.
-- Avaliar a performance de código real em **Python** e **Node.js**.
-- Identificar vantagens e limitações de cada arquitetura.
+## Principais pontos de aprendizagem
 
-Esses testes ajudam a entender conceitos como **eficiência computacional**, **consumo de CPU**, **latência**, e também permitem observar diferenças de **custo-benefício** entre as opções — algo essencial para decisões de arquitetura em nuvem.
+- Diferença entre **x86_64** (Intel/AMD, CISC) e **ARM64** (Graviton, RISC) no mundo AWS.
+- Quando Graviton **ganha** (CPU-bound com boa otimização ARM) e quando **empata ou perde** (memória sequencial, runtime menos otimizado para ARM).
+- Por que Graviton ainda é **mais barato** mesmo quando perde em benchmark individual — ratio custo/performance.
+- Como usar `sysbench` como ferramenta de benchmark portável para avaliar instâncias.
+- Como acessar EC2s via **SSM** sem expor porta 22 (auditoria e segurança).
 
-> ⚠️ Este laboratório é compatível com o ambiente da [AWS Academy Learner Lab](https://awsacademy.instructure.com/), respeitando as limitações de instância, região e permissões.
+## O que você terá ao final
 
-## 📚 Recursos úteis:
+Uma matriz de resultados empíricos (CPU, memória, compressão, Python, Node.js) comparando x86 e Graviton em instâncias equivalentes, e a intuição de qual arquitetura escolher para cada classe de workload.
 
-- 🔗 [Documentação oficial EC2 Graviton](https://docs.aws.amazon.com/ec2/latest/userguide/graviton.html)  
-- 🔗 [Diferenças entre arquiteturas ARM e x86](https://aws.amazon.com/ec2/graviton/)  
-- 🔗 [Sysbench no GitHub](https://github.com/akopytov/sysbench)  
-- 🔗 [Comparação de instâncias EC2](https://instances.vantage.sh/)
+> [!TIP]
+> Os blocos `<details><summary>💡 Clique para entender</summary>` aprofundam cada benchmark. Se estiver com pressa, **pule**.
+
+## Recursos úteis
+
+- [Documentação oficial EC2 Graviton](https://docs.aws.amazon.com/ec2/latest/userguide/graviton.html)
+- [Por que Graviton é mais barato — página de produto AWS](https://aws.amazon.com/ec2/graviton/)
+- [Sysbench no GitHub](https://github.com/akopytov/sysbench)
+- [Comparação de instâncias EC2 (preço/performance)](https://instances.vantage.sh/)
+
+## Mapa do lab
+
+| # | Parte | O que acontece | Tempo |
+|---|-------|---------------|-------|
+| 1 | [Provisionar as duas EC2s](#parte-1---provisionar-as-duas-ec2s) | Terraform sobe `t3.large` (x86) e `t4g.large` (Graviton) com Ubuntu 22.04. Acessar ambas via SSM. | ~10 min |
+| 2 | [Benchmark de CPU single-thread](#parte-2---benchmark-de-cpu-single-thread) | `sysbench cpu` com 1 thread, cálculo de primos. Esperado: Graviton ~3× mais rápido. | ~5 min |
+| 3 | [Benchmark de CPU multi-thread](#parte-3---benchmark-de-cpu-multi-thread) | Mesmo teste com 2 threads (2 vCPUs). Confirma escala. | ~5 min |
+| 4 | [Benchmark de memória](#parte-4---benchmark-de-memória) | Banda de escrita em RAM. Esperado: x86 ~10% à frente. | ~5 min |
+| 5 | [Benchmark de compressão](#parte-5---benchmark-de-compressão-gzip) | `gzip` em 1 GB aleatório. Esperado: Graviton ~17% mais rápido. | ~10 min |
+| 6 | [Workloads reais: Python e Node.js](#parte-6---workloads-reais-python-e-nodejs) | Fibonacci recursivo em Python e SHA-256 em Node.js. | ~10 min |
+| 7 | [Limpeza](#parte-7---limpeza) | `terraform destroy` para zerar o custo. | ~5 min |
+
+<details>
+<summary><b>💡 x86 vs Graviton em 3 parágrafos (abra se nunca viu em aula)</b></summary>
+<blockquote>
+
+**x86_64** é a arquitetura dominante em servidores há décadas. CPUs da Intel (Xeon, Ice Lake) e AMD (EPYC) usam um conjunto de instruções **CISC** — rico, complexo, retrocompatível desde os anos 80. Muito software foi compilado e otimizado especificamente para x86, o que é uma vantagem herdada, não técnica.
+
+**AWS Graviton** é a linha de processadores ARM64 (RISC) desenhada pela própria AWS. Graviton 3 (em `c7g`/`m7g`/`r7g`/`t4g`) entrega, segundo a AWS, **até 40% melhor relação preço/performance** vs. instâncias x86 equivalentes. A fonte do ganho é tripla: ISA mais simples (menos transistores → mais cores por die), design sem precisar suportar retrocompatibilidade com instruções legadas, e integração vertical com a nuvem (AWS desenha para AWS).
+
+A contrapartida: **compatibilidade binária**. Código compilado para x86 não roda em ARM sem recompilar. Linguagens interpretadas ou com JIT (Python, Node.js, Java, Go) recompilam transparentemente. Código nativo (C/C++, Rust) precisa ser recompilado — 99% dos pacotes Linux já têm builds ARM64 pré-construídos. Bibliotecas proprietárias são o ponto de atenção real.
+
+</blockquote>
+</details>
+
+## Contexto
+
+A AWS está empurrando Graviton há anos porque é a arquitetura mais barata para operar dentro dos data centers dela. A pergunta prática para quem decide arquitetura é: **meu workload ganha ou perde ao migrar?** Este lab te dá 6 benchmarks como amostra — você extrapola para seu caso real. O próximo lab ([03.2 ECS+Fargate](../02-ECS-Fargate/README.md)) mostra como escolher a arquitetura de um container ECS entre x86 e Graviton no nível da task definition.
 
 ---
 
-> Ao final, você será capaz de tomar decisões mais informadas sobre o uso de instâncias EC2 com base no perfil de workload, performance e custo.
+## Parte 1 - Provisionar as duas EC2s
 
-1. Dentro do codespace, acesse o diretório onde esta o terraform que irá disponibilizar o ambiente para o laboratório:
+### Resultado esperado desta parte
+
+Duas EC2s em estado `running`, ambas com `3/3 verificações aprovadas` no console, acessíveis via SSM em duas abas do navegador nomeadas `x86` e `graviton`.
+
+1. No Codespaces, entre na pasta do Terraform:
 
 ```bash
 cd /workspaces/fiap-arquitetura-compute-e-storage/03-Compute/01-X86-Graviton/terraform
 ```
 
-2. Altere o arquivo `state.tf` e altere o bucket de acordo com o seu bucket criado no setup `base-config-SEU-RM`. Para tal, execute dos comandos abaixo:
+2. Descubra o bucket de estado e substitua o placeholder em `state.tf`:
 
 ```bash
 export bucket=$(aws s3 ls | awk '/base-config-/ {print $3; exit}')
+echo "Bucket detectado: $bucket"
 sed -i "s/base-config-SEU_RM/$bucket/g" state.tf
 ```
 
-3. Inicialize o terraform:
+Se `Bucket detectado:` veio vazio, **pare** — revise o [Preparando Credenciais](../../01-create-codespaces/Inicio-de-aula.md).
+
+3. Inicialize e aplique o Terraform:
 
 ```bash
 terraform init
-```
-
-4. Aplique o terraform:
-
-```bash
 terraform apply -auto-approve
 ```
 
-Esse terraform irá criar um ambiente com duas instâncias EC2, uma com arquitetura x86 e outra com arquitetura Graviton.
+<details>
+<summary><b>💡 Clique para entender — o que o Terraform provisiona</b></summary>
+<blockquote>
 
-5. Acesse o [console da AWS](https://us-east-1.console.aws.amazon.com/ec2/home?region=us-east-1#Instances:v=3;$case=tags:true%5C,client:false;$regex=tags:false%5C,client:false;sort=instanceState) e verifique o status das instâncias criadas. Aguarde até que ambas estejam em `running` e com status `3/3 verificações aprovadas` como na imagem abaixo:
+Duas EC2s gêmeas em tudo exceto arquitetura:
 
-![EC2 Instances](img/ec2-instances.png)
+| Campo | x86 | Graviton |
+|-------|-----|----------|
+| Tipo | `t3.large` | `t4g.large` |
+| Arquitetura | `x86_64` (Intel) | `arm64` (Graviton 2) |
+| vCPU | 2 | 2 |
+| RAM | 8 GB | 8 GB |
+| Preço on-demand (us-east-1) | ~$0.0832/h | ~$0.0672/h |
 
-6. Para acessar as instancias você vai utilizar o ssm. Para tal, selecione as duas instâncias. E clique em `Conectar`. Isso vai abrir 2 abas, uma para cada instância. Clique em `Conectar` novamente.
+Ambas rodam **Ubuntu 22.04** e executam o mesmo [`install.sh`](terraform/install.sh) via user-data. O script instala `sysbench`, `gzip`, `python3`, `nodejs` e outras dependências. Como o script é idêntico para as duas arquiteturas, o `apt` resolve os pacotes ARM64 ou x86 automaticamente — **zero código específico de arquitetura**.
 
+Acesso é via **SSM Session Manager**, não SSH. Não precisa de chave, não abre porta 22, e o comando fica registrado se você configurar logging.
+
+</blockquote>
+</details>
+
+4. Acesse o [console do EC2](https://us-east-1.console.aws.amazon.com/ec2/home?region=us-east-1#Instances:instanceState=running) e aguarde as duas instâncias atingirem `running` + `3/3 verificações aprovadas` (5-10 min para o user-data terminar de rodar).
+
+<!-- PRINT SUGERIDO: img/ec2-instances.png
+     Console EC2 mostrando as duas instâncias (x86 e graviton) em running com 3/3 checks OK. -->
+![](img/ec2-instances.png)
+
+> [!NOTE]
+> **Não siga antes dos 3/3 verificações** — se o user-data ainda estiver rodando, `sysbench` e outros utilitários vão faltar quando você abrir a sessão. Espere até os checks ficarem verdes.
+
+5. Selecione **as duas instâncias** e clique em `Conectar` na barra superior. Isso vai abrir duas abas de conexão, uma para cada instância.
+
+<!-- PRINT SUGERIDO: img/1.png
+     Tela de conectar com ambas as instâncias selecionadas. -->
 ![](img/1.png)
 
+6. Em cada aba, selecione `Gerenciador de sessões` e clique em `Conectar`.
+
+<!-- PRINT SUGERIDO: img/2.png
+     Aba "Gerenciador de sessões" selecionada com o botão Conectar à vista. -->
 ![](img/2.png)
 
-7. Se o passo anterior foi executado corretamente, você terá 2 abas abertas de terminal no seu navegador, uma para cada instância. Repare nos nomes das abas, uma é `x86` e a outra é `graviton`.
+7. Você terá agora **duas abas de terminal abertas**, uma para cada EC2. **Confira o nome de cada aba** — uma deve ser `x86`, a outra `graviton`. Não confunda durante os benchmarks.
 
+<!-- PRINT SUGERIDO: img/3.png
+     Terminal do SSM da instância x86 conectado. -->
 ![](img/3.png)
 
+<!-- PRINT SUGERIDO: img/4.png
+     Terminal do SSM da instância graviton conectado. -->
 ![](img/4.png)
 
+> [!WARNING]
+> **Daqui em diante todos os comandos das Partes 2-6 rodam nas DUAS sessões SSM simultaneamente.** Execute cada comando em `x86` e `graviton` antes de passar ao próximo passo. Isso permite comparação lado a lado.
 
-> ⚠️ Daqui em diante você vai **executar os comandos em ambos os terminais(x86 e graviton).**
-
-8. Execute o comando abaixo para instalar as dependências necessárias em ambas as maquinas(x86 e graviton). Caso queira ver o script é o [install.sh](terraform/install.sh) que esta na pasta terraform.:
+8. **Em ambas as sessões SSM**, instale as dependências (caso o user-data ainda não tenha terminado, reinstalar é idempotente):
 
 ```bash
 curl -Ssl https://raw.githubusercontent.com/vamperst/fiap-arquitetura-compute-e-storage/refs/heads/master/03-Compute/01-X86-Graviton/terraform/install.sh | bash
 ```
 
-> 💡 **Dica rápida:**  
-> Para manter o terminal organizado durante os testes, pressione `Ctrl + L` para **limpar a tela**.  
-> Isso funciona como o comando `clear` e ajuda a focar apenas na saída do próximo comando.
+> [!TIP]
+> Quando o terminal ficar poluído de saída de comando, pressione **`Ctrl + L`** para limpar (equivalente a `clear`). Facilita focar na saída do benchmark.
 
-9. Vamos inicialmente testar ambos os processadores com o `sysbench`. Execute o comando abaixo em ambos os terminais:
+### Checkpoint
+
+- [x] `terraform apply` terminou com `Apply complete!`.
+- [x] Console EC2 mostra `x86` e `graviton` em `running` com `3/3 verificações aprovadas`.
+- [x] Duas sessões SSM abertas, claramente identificadas.
+- [x] `sysbench --version` funciona em ambas as sessões.
+
+<details>
+<summary><b>⚠ Se der erro: <code>sysbench: command not found</code></b></summary>
+<blockquote>
+O user-data ainda estava rodando quando você conectou. Re-execute o `curl ... | bash` do passo 8 para forçar a instalação.
+</blockquote>
+</details>
+
+---
+
+## Parte 2 - Benchmark de CPU single-thread
+
+### Resultado esperado desta parte
+
+Graviton processa aproximadamente **3× mais eventos por segundo** que x86 neste teste — a vantagem ARM para cálculo matemático pesado fica evidente.
+
+9. **Em ambas as sessões** (x86 e graviton), execute:
 
 ```bash
 sysbench cpu --cpu-max-prime=20000 --time=10 run
 ```
 
+<!-- PRINT SUGERIDO: img/5.png
+     Saída do sysbench na instância x86: events per second ~317. -->
 ![](img/5.png)
 
+<!-- PRINT SUGERIDO: img/6.png
+     Saída do sysbench na instância graviton: events per second ~1070. -->
 ![](img/6.png)
 
 <details>
-<summary>   
-<b>Explicação do comando sysbench com uma thread</b>
-</summary>
+<summary><b>💡 Clique para entender — o que <code>sysbench cpu</code> mede</b></summary>
 <blockquote>
 
-## 🧠 **O que é o `sysbench`?**
+O módulo `cpu` do sysbench calcula **números primos até N** repetidamente pelo tempo especificado. Por que primos? Porque é um cálculo que:
 
-O `sysbench` é uma ferramenta de benchmarking modular usada para avaliar o desempenho de:
-- CPU
-- Memória
-- I/O (entrada/saída)
-- Threads
-- Banco de dados (MySQL, etc.)
+- Usa **apenas CPU** (não disco, rede ou RAM intensiva).
+- Não é vetorizável trivialmente (evita que SIMD distorça a comparação).
+- Repetitivo e determinístico (variação entre execuções é baixa).
 
-No nosso caso, estamos usando o módulo **`cpu`**, que foca apenas no poder de processamento da CPU.
+Flags usados:
 
----
+- `--cpu-max-prime=20000` → calcula primos até 20k a cada iteração.
+- `--time=10` → roda por 10 segundos.
+- Default: **1 thread** (single-core).
 
-## 🔍 **Explicação do comando por partes:**
+Métricas que importam:
 
-### `sysbench cpu`
-Seleciona o **teste de CPU** (módulo que executa cálculos matemáticos intensivos, como números primos).
-
----
-
-### `--cpu-max-prime=20000`
-Define o **limite até onde o `sysbench` vai calcular números primos**.
-
-- Nesse caso, ele calcula **todos os números primos até 20.000**.
-- Esse cálculo é feito repetidamente dentro do tempo especificado (`--time=10`).
-- A complexidade do cálculo cresce linearmente com esse valor. Se você aumentar esse número, o teste será mais pesado.
-
-📌 **Por que primos?**
-- Calcular números primos exige operações matemáticas intensivas e repetitivas.
-- Isso força a CPU a **trabalhar com cálculos reais**, sem depender de disco, rede ou RAM, focando apenas no processamento puro.
-
----
-
-### `--time=10`
-Define que o teste deve rodar por **10 segundos**.
-
-- Durante esse tempo, o `sysbench` executa o cálculo de primos continuamente.
-- O resultado será o número de vezes que ele conseguiu executar o cálculo dentro do tempo.
-
----
-
-### `run`
-Executa o teste com os parâmetros definidos.
-
----
-
-## 📊 **O que o teste mede?**
-
-Após rodar, o `sysbench` exibe várias métricas importantes:
-
-| Métrica                  | Significado                                                                 |
-|--------------------------|------------------------------------------------------------------------------|
-| `events per second`      | Quantos cálculos completos foram feitos por segundo (indicador de performance). |
-| `total number of events` | Quantas vezes o teste foi completado em 10s.                                 |
-| `avg latency`            | Tempo médio (em ms) para completar um cálculo.                              |
-| `min/max latency`        | Melhor e pior tempo de resposta de um cálculo individual.                   |
-
----
-
-## 💥 **Impacto no desempenho da CPU**
-
-Esse teste:
-
-- **Utiliza apenas 1 thread** por padrão → ele mede o desempenho de **um único núcleo da CPU**.
-- Ajuda a avaliar **eficiência da arquitetura** (instruções por ciclo, desempenho por watt, etc.).
-- Ideal para comparar instâncias com arquiteturas diferentes (ex: Graviton vs Intel).
-- Pode **mostrar gargalos** ou instâncias subdimensionadas para cargas de trabalho com uso intenso de CPU.
-
----
-
-
-## ✅ **Resumo**
-
-O comando `sysbench cpu --cpu-max-prime=20000 --time=10 run`:
-
-- Calcula números primos até 20.000 repetidamente por 10 segundos.
-- Mede o desempenho **puro da CPU** (sem interferência de disco ou memória).
-- Mostra quantos cálculos são feitos por segundo e quanto tempo cada um leva.
-- É ideal para **comparar performance entre diferentes tipos de instância ou arquitetura.**
+- **Events per second** → quantos cálculos completos em 1 segundo. Quanto maior, melhor.
+- **Avg latency (ms)** → tempo médio por cálculo. Quanto menor, melhor.
 
 </blockquote>
 </details>
 
-Esse comando mede quantos eventos (cálculos de primos) por segundo a CPU consegue realizar, além de dados como latência média e total de eventos processados.
+Ordem de grandeza esperada (varia com carga do hypervisor):
+
+| Métrica | x86 (`t3.large`) | Graviton (`t4g.large`) |
+|---------|------------------|-------------------------|
+| Events/s | ~317 | ~1070 |
+| Total events (10s) | ~3178 | ~10704 |
+| Avg latency (ms) | ~3.14 | ~0.93 |
+
+A vantagem Graviton em single-thread vem em boa parte da frequência sustentada mais alta e da ISA mais direta para cálculos aritméticos.
+
+### Checkpoint
+
+- [x] Valores de `events per second` anotados para as duas máquinas.
+- [x] Graviton apresentou valor **significativamente maior** (esperado ~3×).
 
 ---
 
-## ⚙️ Resultado em Instância x86 (`t3.large`)
+## Parte 3 - Benchmark de CPU multi-thread
 
-CPU speed:  
-events per second: 317.63  
-total number of events: 3178  
-avg latency: 3.14 ms
+### Resultado esperado desta parte
 
----
+Confirma a escala com 2 threads (ambas as máquinas têm 2 vCPUs). A proporção entre x86 e Graviton se mantém similar à Parte 2.
 
-## ⚙️ Resultado em Instância Graviton (`t4g.large`)
-
-CPU speed:  
-events per second: 1070.16  
-total number of events: 10704  
-avg latency: 0.93 ms
-
----
-
-## 📊 Análise dos Resultados
-
-| Métrica                  | x86 (t3.large) | Graviton (t4g.large) | Diferença aproximada    |
-|--------------------------|----------------|------------------------|--------------------------|
-| Eventos por segundo      | 317.63         | 1070.16                | 🔺 ~3.4x mais rápido      |
-| Total de eventos         | 3178           | 10704                  | 🔺 ~3.4x mais eventos     |
-| Latência média (ms)      | 3.14           | 0.93                   | 🔻 Menor no Graviton      |
-
-A instância Graviton apresentou desempenho **mais de 3 vezes superior** no cálculo de números primos com uma única thread. Isso destaca a **eficiência da arquitetura ARM** para operações matemáticas e workloads computacionais intensivos.
-
----
-
-## 🧠 Considerações
-
-- Resultados podem variar de acordo com a carga da máquina ou momento do teste.
-- Graviton é projetado para oferecer **melhor desempenho por watt**, sendo ideal para ambientes escaláveis e econômicos.
-- Algumas aplicações que dependem de bibliotecas nativas x86 podem exigir ajustes para rodar em ARM, mas linguagens como Python, Node.js e Java funcionam normalmente.
-
-10. Agora vamos testar com 2 threads já que ambas as maquinas tem 2 vCPUs. Execute o comando abaixo em ambos os terminais:
+10. **Em ambas as sessões**, execute:
 
 ```bash
 sysbench cpu --cpu-max-prime=30000 --time=40 --threads=2 run
 ```
 
+<!-- PRINT SUGERIDO: img/Chart1.png
+     Gráfico/saída comparativa de events/s entre x86 e graviton com 2 threads. -->
 ![](img/Chart1.png)
 
+<!-- PRINT SUGERIDO: img/Chart2.png
+     Gráfico de total de eventos em 40s. -->
 ![](img/Chart2.png)
 
+<!-- PRINT SUGERIDO: img/Chart3.png
+     Gráfico de latência média. -->
 ![](img/Chart3.png)
 
-### 📊 Análise do Teste com 2 Threads (sysbench)
+Ordem de grandeza esperada:
 
-Este novo teste utilizou dois threads para estressar os dois vCPUs disponíveis em cada instância. O objetivo foi observar como cada arquitetura se comporta quando usamos **paralelismo**, ou seja, ambos os núcleos da instância operando ao mesmo tempo com uma carga intensa.
+| Métrica | x86 (`t3.large`) | Graviton (`t4g.large`) |
+|---------|------------------|-------------------------|
+| Events/s | ~369 | ~1217 |
+| Total events (40s) | ~14.779 | ~48.687 |
+| Avg latency (ms) | ~5.41 | ~1.64 |
 
----
+A diferença de latência (**~70% menor no Graviton**) reforça a intuição: para APIs que respondem por evento, Graviton devolve mais rápido por request.
 
-### ✅ Principais Resultados:
+### Checkpoint
 
-| Métrica                    | x86 (t3.large) | Graviton (t4g.large) |
-|---------------------------|----------------|-----------------------|
-| **Eventos por segundo**   | 369.42         | 1217.08              |
-| **Total de eventos (40s)**| 14.779         | 48.687               |
-| **Latência média (ms)**   | 5.41           | 1.64                 |
-
----
-
-### 📈 Interpretação dos Gráficos:
-
-1. **Eventos por Segundo:**  
-   O Graviton apresentou uma taxa de eventos por segundo mais de **3 vezes maior** que o x86. Isso mostra que ele consegue processar mais operações computacionais em menos tempo, mesmo sob carga paralela.
-
-2. **Total de Eventos:**  
-   Em 40 segundos, a instância Graviton executou **48.687 eventos**, contra apenas **14.779** da x86. Isso confirma a superioridade da arquitetura ARM na execução simultânea de múltiplos cálculos.
-
-3. **Latência Média:**  
-   A latência por operação no Graviton foi de apenas **1.64 ms**, contra **5.41 ms** na x86 — uma diferença de **quase 70% a menos**, indicando maior responsividade e menor custo por operação.
+- [x] Mesmo padrão da Parte 2 se manteve — Graviton ~3× mais rápido em events/s.
+- [x] Latência Graviton ~70% menor.
 
 ---
 
-### 🧠 Conclusão:
+## Parte 4 - Benchmark de memória
 
-O teste com dois threads deixa ainda mais evidente a vantagem da arquitetura Graviton (ARM64) sobre a x86 (Intel/AMD) para workloads **CPU-bound com múltiplos núcleos**.
+### Resultado esperado desta parte
 
+x86 ganha esse teste **por ~10%**. Ao contrário da CPU, banda de memória é uma área onde x86 ainda tem vantagem marginal em instâncias comparáveis.
 
-11. O teste seguinte é sobre a memória. Execute o comando abaixo em ambos os terminais(x86 e graviton):
+11. **Em ambas as sessões**, execute:
 
 ```bash
 sysbench memory --memory-block-size=1M --memory-total-size=10G run
 ```
 
 <details>
-<summary>
-<b>Explicação do comando sysbench para teste de memória</b>
-</summary>
+<summary><b>💡 Clique para entender — <code>sysbench memory</code> em 3 parágrafos</b></summary>
 <blockquote>
 
-## 💾 Teste de Desempenho de Memória com Sysbench
+O módulo `memory` faz **leituras e escritas sequenciais na RAM** sem tocar disco ou rede. O objetivo é medir a **banda pura de memória** do par CPU+RAM.
 
-Para avaliar a velocidade de leitura/escrita da memória RAM da instância, utilizamos o seguinte comando:
+Flags:
 
-``` bash
-sysbench memory --memory-block-size=1M --memory-total-size=10G run
-```
+- `--memory-block-size=1M` → cada operação manipula 1 MB.
+- `--memory-total-size=10G` → teste processa 10 GB no total.
 
-### 🔍 O que este comando faz:
+Métricas: velocidade em **MiB/s** e latência média.
 
-Este teste mede a taxa de transferência de memória (memory throughput), ou seja, **quão rápido a instância consegue movimentar dados na RAM**.
-
-- `--memory-block-size=1M`: Cada operação manipula blocos de 1 megabyte.
-- `--memory-total-size=10G`: O teste executa operações até atingir um total de 10 gigabytes de dados processados.
-
-O `sysbench` realiza **leituras e escritas sequenciais** na memória, sem envolver disco, CPU pesada ou rede. O resultado inclui a **velocidade média de transferência em MB/s** e as métricas de latência de acesso.
-
-### 🧪 Quando usar:
-
-Este comando é útil para:
-- Comparar a performance de memória entre instâncias de diferentes arquiteturas (ex: Graviton vs x86).
-- Avaliar a consistência do throughput de memória sob carga.
-- Identificar gargalos em workloads com uso intensivo de RAM (ex: caches, bancos em memória, análises).
+Use este benchmark para estimar performance de: caches em RAM (Redis local, memcached), bancos in-memory (DuckDB, Polars), processamento de arquivos grandes em buffer. Se o workload é **memory-bound**, esse número é mais relevante que o `cpu`.
 
 </blockquote>
 </details>
 
----
+Ordem de grandeza esperada:
 
-Este comando mede a velocidade de escrita na memória RAM, utilizando blocos de 1 MB até atingir um total de 10 GB de dados. O teste foi executado com **apenas 1 thread**, para comparar a performance de acesso sequencial à memória em diferentes arquiteturas.
+| Métrica | x86 (`t3.large`) | Graviton (`t4g.large`) |
+|---------|------------------|-------------------------|
+| Velocidade (MiB/s) | ~14021 | ~12637 |
+| Latência (ms) | ~0.07 | ~0.08 |
+| Tempo total (s) | ~0.73 | ~0.81 |
 
----
+### Checkpoint
 
-### ⚙️ Resultado - Instância x86 (`t3.large`)
-
-- **Velocidade de escrita**: `14021.56 MiB/sec`
-- **Tempo total do teste**: `0.7286 s`
-- **Latência média**: `0.07 ms`
-- **Total de operações**: `10240`
-
----
-
-### ⚙️ Resultado - Instância Graviton (`t4g.large`)
-
-- **Velocidade de escrita**: `12637.23 MiB/sec`
-- **Tempo total do teste**: `0.8088 s`
-- **Latência média**: `0.08 ms`
-- **Total de operações**: `10240`
+- [x] x86 ~10% mais rápido em banda de memória.
+- [x] Ambos com latência sub-milissegundo (excelente para workloads in-memory).
 
 ---
 
-## 📊 Análise Comparativa
+## Parte 5 - Benchmark de compressão (gzip)
 
-| Métrica                | x86 (t3.large) | Graviton (t4g.large) | Diferença                  |
-|------------------------|----------------|------------------------|-----------------------------|
-| Velocidade (MiB/sec)   | 14021.56       | 12637.23               | 🔺 x86 ~10% mais rápido      |
-| Latência média (ms)    | 0.07           | 0.08                   | 🔻 Graviton levemente maior |
-| Tempo total (s)        | 0.7286         | 0.8088                 | 🔺 x86 completou mais rápido |
+### Resultado esperado desta parte
 
----
+Graviton ~17% mais rápido a comprimir 1 GB de dados aleatórios. Compressão é um dos casos onde a ISA mais direta do ARM casa bem com algoritmos bit-twiddling.
 
-## 🧠 Interpretação
-
-Neste teste, a instância **x86 (t3.large)** demonstrou desempenho de memória levemente superior em comparação à **Graviton (t4g.large)**. A taxa de transferência ficou cerca de **10% mais alta** na x86, e o tempo total de execução foi menor.
-
-No entanto, ambos os resultados são **excelentes** e mostram que as duas arquiteturas oferecem **alto desempenho de acesso à memória** em operações sequenciais. A diferença observada pode estar relacionada à forma como cada arquitetura lida com buffer/cache ou instruções SIMD otimizadas para memória.
-
-Este teste é especialmente útil para workloads que envolvem **manipulação de grandes volumes de dados em memória**, como caches, bancos de dados in-memory ou processamento de arquivos.
-
----
-
-## 🔍 Observação
-
-Resultados podem variar levemente entre execuções. Para uma medição mais precisa, recomenda-se:
-- Repetir o teste algumas vezes e calcular a média.
-- Testar com múltiplos threads (`--threads=2`, por exemplo).
-- Monitorar métricas do sistema com `htop` ou `top` durante o teste.
-
-
-12. O próximo teste é sobre compressão. Execute o comando abaixo em ambos os terminais(x86 e graviton):
+12. **Em ambas as sessões**, execute:
 
 ```bash
 mkdir -p teste-arquivo && cd teste-arquivo
 dd if=/dev/urandom of=testfile.bin bs=1M count=1024
 time gzip testfile.bin
 ```
+
+<!-- PRINT SUGERIDO: img/Chart4.png
+     Gráfico de tempo total de compressão: x86 ~48s, graviton ~40s. -->
+![](img/Chart4.png)
+
+<!-- PRINT SUGERIDO: img/Chart5.png
+     Gráfico de throughput na criação do dd. -->
+![](img/Chart5.png)
+
+<!-- PRINT SUGERIDO: img/Chart6.png
+     Gráfico de tempo de CPU user+sys. -->
+![](img/Chart6.png)
+
 <details>
-<summary>
-<b>Explicação do comando para teste de compressão</b>
-</summary>
+<summary><b>💡 Clique para entender — por que <code>/dev/urandom</code></b></summary>
 <blockquote>
 
-O comando fornecido realiza duas operações distintas: criação de um arquivo com dados aleatórios e compressão desse arquivo usando o Gzip. Vamos detalhar cada etapa:
+Usamos dados aleatórios (`/dev/urandom`) no lugar de zeros porque zeros comprimem muito bem e o benchmark vira medida de memória, não de CPU. Dados aleatórios **não comprimem** — o gzip trabalha sem achar padrão algum, maximizando uso de CPU.
 
-### 1. Criação do arquivo com `dd`
-```bash
-dd if=/dev/urandom of=testfile.bin bs=1M count=1024
-```
-- **`if=/dev/urandom`**: Define como origem o dispositivo especial `/dev/urandom`, que gera dados aleatórios.
-- **`of=testfile.bin`**: Define o destino como o arquivo `testfile.bin`, onde os dados aleatórios serão gravados.
-- **`bs=1M`**: Especifica o tamanho do bloco de dados a ser transferido como 1 megabyte.
-- **`count=1024`**: Define que 1024 blocos de 1 MB serão escritos, resultando em um arquivo de aproximadamente 1 GB.
-
-Essa etapa cria um arquivo grande preenchido com dados aleatórios. O uso de `/dev/urandom` garante que os dados sejam imprevisíveis, tornando o arquivo adequado para testes de desempenho ou segurança.
-
-### 2. Compressão do arquivo com Gzip
-```bash
-time gzip testfile.bin
-```
-- **`gzip testfile.bin`**: Compacta o arquivo gerado (`testfile.bin`) utilizando o algoritmo Gzip, que combina LZ77 e codificação Huffman para reduzir redundâncias nos dados.
-- **`time`**: Mede o tempo necessário para executar a compressão.
-
-### Impacto no desempenho do CPU
-- **Etapa `dd`:** A criação do arquivo consome recursos do CPU devido à geração de números aleatórios por `/dev/urandom`. Esse processo pode ser intensivo em sistemas com CPUs menos robustos.
-- **Etapa `gzip`:** A compressão utiliza recursos significativos do CPU para aplicar os algoritmos LZ77 e Huffman. Como os dados são aleatórios, a compressão será menos eficiente (menor redução no tamanho do arquivo), pois não há padrões repetitivos para explorar.
-
-### Resumo
-Este comando é útil para testar o desempenho do sistema em operações intensivas de E/S (entrada e saída) e compressão. Ele avalia:
-1. A capacidade do sistema de gerar grandes volumes de dados aleatórios.
-2. A eficiência do CPU na compressão de arquivos grandes.
+A geração do arquivo pelo `dd if=/dev/urandom` também é custosa: é o kernel rodando CSPRNG. O Graviton tende a gerar urandom **mais rápido** que x86, o que aparece no throughput do `dd` também.
 
 </blockquote>
 </details>
 
-![](img/Chart4.png)
+Ordem de grandeza esperada:
 
-![](img/Chart5.png)
+| Métrica | x86 (`t3.large`) | Graviton (`t4g.large`) |
+|---------|------------------|-------------------------|
+| Tempo total de `gzip` (real) | ~48s | ~40s |
+| Throughput do `dd urandom` | ~227 MB/s | ~273 MB/s |
+| CPU user+sys | ~48s | ~39s |
 
-![](img/Chart6.png)
+Graviton ganha em **três frentes** simultâneas: menos tempo total, maior throughput de urandom, menos CPU gasto.
 
----
+### Checkpoint
 
-## 📊 Comparativo de Desempenho
-
-### ⏱️ **Tempo total de compressão (`real`)**
-
-- **x86 (t3.large):** 48.13 segundos  
-- **Graviton (t4g.large):** 39.79 segundos
-
-> 🔺 Graviton foi ~17% mais rápido na compressão do mesmo arquivo.
+- [x] Tempos anotados para os dois.
+- [x] Graviton foi ~15-20% mais rápido em compressão.
 
 ---
 
-### ⚙️ **Velocidade de escrita com `dd` (criação do arquivo)**
+## Parte 6 - Workloads reais: Python e Node.js
 
-- **x86:** 227 MB/s  
-- **Graviton:** 273 MB/s
+### Resultado esperado desta parte
 
-> Graviton teve **maior throughput de escrita**, o que pode indicar melhor acesso à RAM e/ou I/O otimizado.
+Python recursivo: x86 levemente à frente (~3-8%). Node.js hashing: praticamente empate. Graviton não vence sempre — runtime e bibliotecas C subjacentes importam.
 
----
-
-### 🧠 **Uso de CPU (`user` + `sys`)**
-
-- **x86:** 46.64s (user) + 1.46s (sys)
-- **Graviton:** 38.58s (user) + 1.15s (sys)
-
-> A instância Graviton foi mais eficiente tanto no processamento do usuário quanto no uso do sistema (syscalls, compressão interna).
-
----
-
-## ✅ Conclusão
-
-- Graviton foi mais rápido, consumiu menos tempo de CPU e apresentou melhor throughput na escrita de dados aleatórios.
-- Isso mostra que a arquitetura ARM tem **vantagens reais em tarefas de compressão e manipulação de arquivos**, mesmo com workloads que utilizam uma única thread.
-- Para workloads com uso intensivo de CPU e compressão, **Graviton pode oferecer desempenho superior com menor custo**.
-
-
-13. O próximo teste é sobre Python. Execute o comando abaixo em ambos os terminais(x86 e graviton):
+13. **Teste Python** — cálculo recursivo de Fibonacci(40). **Em ambas as sessões**:
 
 ```bash
 echo "🐍 Teste com Python - cálculo de Fibonacci"
@@ -468,66 +403,30 @@ start = time.time()
 print(f"Fibonacci(40): {fib(40)}")
 print(f"Execution Time: {time.time() - start} seconds")
 EOF
-
 python3 cpustress.py
 ```
 
+Ordem de grandeza esperada:
 
-# 🧠 Comparativo de Desempenho: Cálculo de Fibonacci em Python (x86 vs Graviton)
+| Arquitetura | Tempo de execução |
+|-------------|-------------------|
+| x86 (`t3.large`) | ~37.9s |
+| Graviton (`t4g.large`) | ~41.0s |
 
-Este teste executa um algoritmo recursivo para calcular `Fibonacci(40)`, uma operação computacionalmente intensiva que força a CPU com chamadas de função repetitivas. O objetivo é comparar a eficiência das arquiteturas **x86 (t3.large)** e **Graviton (t4g.large)** usando código puro em Python.
+<details>
+<summary><b>💡 Por que x86 ganha esse aqui e Graviton perde</b></summary>
+<blockquote>
 
-## 🔢 Código executado
+Python CPython é um **interpretador**, não JIT — cada chamada de função recursiva passa por bytecode + dispatch de opcode em software. Esse dispatch foi **historicamente mais otimizado para x86**, especialmente em micro-benchmarks de recursão pesada.
 
-```python
-import time
+Alternativas que mudam o resultado: **PyPy** (JIT) costuma ser mais rápido em ambas e muitas vezes inverte o resultado. Bibliotecas nativas (NumPy, pandas) usam BLAS/LAPACK otimizados por arquitetura — nesses casos, Graviton volta a ganhar.
 
-def fib(n):
-    if n <= 1:
-        return n
-    else:
-        return fib(n-1) + fib(n-2)
+Lição: **não extrapole** o resultado de um benchmark para todo o ecossistema da linguagem. Mede o seu workload real.
 
-start = time.time()
-print(f"Fibonacci(40): {fib(40)}")
-print(f"Execution Time: {time.time() - start} seconds")
-```
+</blockquote>
+</details>
 
----
-
-## ⏱️ Resultados
-
-| Arquitetura       | Tempo de Execução |
-|-------------------|-------------------|
-| x86 (t3.large)    | **37.94 s**       |
-| Graviton (t4g.large) | **41.03 s**    |
-
----
-
-## 📊 Análise
-
-- A instância **x86** executou o código aproximadamente **3 segundos mais rápido** que a Graviton.
-- Embora o Graviton seja geralmente mais eficiente em tarefas multithread e workloads otimizados, esse resultado mostra que:
-  - Para **scripts Python interpretados e com muita recursão**, o x86 ainda pode ter **vantagem leve**, especialmente com interpretadores otimizados para essa arquitetura.
-- Essa diferença pode ser influenciada por:
-  - Implementação do interpretador Python (CPython).
-  - Otimizações em nível de instrução específicas da arquitetura.
-  - Características da chamada de função recursiva em ambientes ARM.
-
----
-
-## ✅ Conclusão
-
-Ambas as instâncias completaram a tarefa com sucesso, mas o x86 apresentou uma leve vantagem em **execução recursiva pesada com Python**.
-
-Para workloads computacionais mais complexos, vale a pena considerar:
-- Testes com versões otimizadas de Python (como PyPy).
-- Testes com múltiplas threads ou uso de NumPy.
-- O custo-benefício da instância no cenário real.
-
-> ℹ️ Graviton ainda tende a ser mais eficiente em termos de custo por hora, mesmo com desempenho levemente inferior nesse caso específico.
-
-14. O último teste é sobre Node.js. Execute o comando abaixo em ambos os terminais(x86 e graviton):
+14. **Teste Node.js** — SHA-256 × 10 milhões de iterações. **Em ambas as sessões**:
 
 ```bash
 echo "🟦 Teste com Node.js - hash SHA256"
@@ -540,46 +439,112 @@ for (let i = 0; i < 1e7; i++) {
 }
 console.timeEnd('hash');
 EOF
-
 node hash.js
 ```
 
-# 🔐 Comparativo de Desempenho: Criptografia SHA256 com Node.js (x86 vs Graviton)
+Ordem de grandeza esperada:
 
-Neste teste, utilizamos um código em **Node.js** para calcular o hash **SHA256** da string `"AWS Academy"` dez milhões de vezes (`1e7`). O objetivo é comparar a performance entre duas arquiteturas de instância EC2: **x86 (t3.large)** e **Graviton (t4g.large)**.
+| Arquitetura | Tempo de execução |
+|-------------|-------------------|
+| x86 (`t3.large`) | ~28.6s |
+| Graviton (`t4g.large`) | ~29.1s |
 
+**Diferença < 2%** — praticamente empate. Quando o runtime e a biblioteca subjacente (OpenSSL, neste caso) têm builds bem otimizados para as duas ISAs, a arquitetura **deixa de ser o fator dominante**.
 
----
+### Checkpoint
 
-## ⏱️ Resultados
-
-| Arquitetura       | Tempo de Execução |
-|-------------------|-------------------|
-| x86 (t3.large)    | **28.589 s**      |
-| Graviton (t4g.large) | **29.127 s**   |
-
----
-
-## 📊 Análise
-
-- A diferença de tempo foi **pequena (menos de 2%)**, com **x86 levemente mais rápido** neste cenário específico.
-- O teste é intensivo em **CPU e operações de hash**, com grande número de iterações, mas **não multithread**.
-- A diferença sutil pode estar relacionada a:
-  - Otimizações do **Node.js nativo** para x86.
-  - Overhead do runtime em ARM (mesmo que pequeno).
-  - Uso de bibliotecas criptográficas subjacentes otimizadas para diferentes arquiteturas.
+- [x] Python: x86 levemente mais rápido em recursão pesada.
+- [x] Node.js: empate técnico.
+- [x] Lição absorvida: Graviton não vence sempre, mas perde por pouco — e é mais barato.
 
 ---
 
-## ✅ Conclusão
+## Parte 7 - Limpeza
 
-Tanto o x86 quanto o Graviton apresentaram desempenho muito próximo ao processar operações criptográficas em Node.js. A diferença é praticamente **irrelevante em termos práticos**, o que mostra que workloads de hashing **são bem suportados em ambas as arquiteturas**.
+### Resultado esperado desta parte
 
-> 💡 Para workloads escaláveis ou em larga escala, o **Graviton pode ainda ser mais vantajoso** devido ao seu custo-benefício em relação à performance por dólar.
+Ambas as EC2s destruídas, conta AWS sem cobrança residual.
 
-15. De volta ao terminal do **Codespaces** execute o comando abaixo para finalizar o laboratório deletando as instâncias criadas:
+> [!CAUTION]
+> Duas EC2s `.large` custam ~$0.15/hora somadas (~$3.60/dia). Em uma semana esquecida você esgota boa parte da cota da AWS Academy. **Destrua agora**.
+
+15. **No Codespaces** (não na sessão SSM — a sessão SSM morre quando a EC2 morre), destrua o ambiente:
 
 ```bash
 cd /workspaces/fiap-arquitetura-compute-e-storage/03-Compute/01-X86-Graviton/terraform
 terraform destroy -auto-approve
 ```
+
+16. Confirme que as instâncias sumiram:
+
+```bash
+aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=x86,graviton" "Name=instance-state-name,Values=running" \
+  --query "Reservations[].Instances[].InstanceId"
+```
+
+Saída esperada: `[]`.
+
+### Checkpoint
+
+- [x] `terraform destroy` terminou com `Destroy complete!`.
+- [x] Nenhuma EC2 `x86` ou `graviton` aparece em estado `running`.
+
+---
+
+## Conclusão
+
+Três lições do lab, destiladas dos 6 benchmarks:
+
+1. **Graviton vence em CPU e compressão — onde a ISA importa.** 3× em cálculo aritmético, ~17% em gzip. Para workloads CPU-bound com software bem portado para ARM, Graviton entrega mais performance por core.
+2. **Graviton empata ou perde em memória e runtime interpretado.** Banda de RAM, Python recursivo. Não é regra — tende a ser função de otimização de biblioteca subjacente.
+3. **Graviton é ~20% mais barato** em todas as classes (`t4g` vs `t3`, `c7g` vs `c6i`, etc). Mesmo **empatando** em performance, o custo por hora fica menor — daí o 40% preço/performance anunciado pela AWS em workloads bem portados.
+
+A decisão de migrar não é "Graviton sempre" nem "x86 sempre" — é **"meça o seu workload real"**. Este lab te deu a ferramenta (sysbench, time, scripts) para fazer essa medição.
+
+## Próximo passo
+
+No [lab 03.2 de ECS+Fargate](../02-ECS-Fargate/README.md) você aplica essa decisão em um container ECS. A arquitetura da task definition (`runtime_platform`) é onde você marca x86 ou ARM — exatamente o ponto de decisão que este lab te preparou para tomar.
+
+---
+
+<details>
+<summary><b>💡 Glossário rápido</b></summary>
+<blockquote>
+
+| Termo | O que é |
+|-------|---------|
+| x86_64 | ISA CISC dominante em servidores (Intel, AMD). Retrocompatível desde os 80. |
+| ARM64 | ISA RISC moderna. Usada em Graviton (AWS), Ampere, Apple Silicon. |
+| Graviton | Linha de CPUs ARM desenhada pela AWS. Graviton 2/3/4 disponíveis. |
+| `t3.large` | EC2 x86 burstable de 2 vCPU + 8 GB RAM. |
+| `t4g.large` | EC2 Graviton 2 equivalente a `t3.large`, ~20% mais barato. |
+| `sysbench` | Ferramenta de benchmark modular portável (CPU, memória, I/O, MySQL). |
+| SSM Session Manager | Serviço AWS que dá shell em EC2 sem expor porta 22. |
+| SIMD | Single Instruction Multiple Data — instruções vetoriais (AVX no x86, NEON no ARM). |
+| CISC / RISC | Complex vs Reduced Instruction Set Computing — filosofias de design de ISA. |
+| `/dev/urandom` | Dispositivo Linux que entrega bytes criptograficamente aleatórios. |
+| `time` | Built-in shell que mede o tempo de execução de um comando (real, user, sys). |
+
+</blockquote>
+</details>
+
+<details>
+<summary><b>💡 Como pedir ajuda se travou</b></summary>
+<blockquote>
+
+**Antes de abrir issue ou chamar o professor, colete:**
+
+1. Em qual passo (número) travou.
+2. A mensagem de erro **literal** (copie e cole).
+3. Em qual máquina o erro apareceu (`x86`, `graviton`, Codespaces).
+4. O que `uname -m` retorna dentro da EC2 (deve ser `x86_64` ou `aarch64`).
+
+**Canais, em ordem:**
+
+1. [Issues deste repositório](https://github.com/rafaelmbarbosa/fiap-arquitetura-compute-e-storage/issues) — preferido, cria histórico pesquisável.
+2. Email do professor com os 4 itens acima.
+3. Na sala de aula, durante o laboratório.
+
+</blockquote>
+</details>
