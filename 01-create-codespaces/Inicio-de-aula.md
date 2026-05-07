@@ -15,6 +15,11 @@ Todo laboratório começa com o mesmo ritual: **sincronizar o fork** (puxar novo
 > Se você já fez este ritual na aula de **HOJE**, pode pular direto para o lab. As credenciais duram 4 horas — só recomeça se passou disso ou se o `aws s3 ls` começou a falhar.
 
 ## Mapa do ritual
+1. Acesse o seu github no repositório que fez fork do repositório da disciplina **fiap-arquitetura-compute-e-storage**.
+2. Clique em `Sync Fork` no meio da tela para sincronizar o repositório com o repositório original. Caso tenha algo para sincronizar, clique em `Update branch` para sincronizar o repositório como na imagem abaixo:
+   
+   
+   ![](img/sync1.png)
 
 | # | Parte | O que acontece |
 |---|-------|---------------|
@@ -32,6 +37,8 @@ Todo laboratório começa com o mesmo ritual: **sincronizar o fork** (puxar novo
 Fork do repo na sua conta alinhado com o upstream (repositório original), com quaisquer labs novos disponíveis.
 
 1. Acesse seu fork do repositório em [github.com](https://github.com) (na sua conta, não na conta `vamperst`).
+3. Acesse o seu codespaces, para isso acesse o link [Github Codespaces](https://github.com/codespaces)
+4. Clique no nome do Codespaces que você criou para as aulas, ele esta derivado do repositório fiap-arquitetura-compute-e-storage. 
 
 2. Clique em `Sync fork` (meio da tela, perto do botão `Code`). Se aparecer `Update branch`, clique nele para sincronizar.
 
